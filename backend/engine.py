@@ -11,6 +11,7 @@ import pickle
 import logging
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
+from .gcp_utils import GCSManager, setup_cloud_logging, is_running_on_gcp
 
 # Conditional imports with graceful fallback
 try:
@@ -72,6 +73,11 @@ class WaselEngine:
         for d in [self.landmarks_dir, self.models_dir, self.videos_dir]:
             d.mkdir(parents=True, exist_ok=True)
         
+        # ─── GCP Integration ───
+        setup_cloud_logging()
+        self.gcs = GCSManager()
+        self._sync_with_cloud()
+        
         # ─── Backend Selection ───
         self.backend = self._select_backend(yolo_weights, tf_model_path, legacy_model_path)
         
@@ -84,6 +90,13 @@ class WaselEngine:
         
         logger.info(f"🚀 WaselEngine initialized | Backend: {self.backend['pose']} + {self.backend['classifier']}")
         logger.info(f"   Vocabulary: {len(self.landmark_dict)} words loaded")
+
+    def _sync_with_cloud(self):
+        """Sync local assets with GCS on initialization."""
+        if self.gcs.client:
+            logger.info("☁️ Syncing assets with Cloud Storage...")
+            self.gcs.sync_directory(self.landmarks_dir, "landmarks/")
+            self.gcs.sync_directory(self.models_dir, "models/")
 
     def _select_backend(self, yolo_weights, tf_model_path, legacy_model_path) -> dict:
         """Smart backend selection with graceful degradation."""
@@ -357,6 +370,9 @@ class WaselEngine:
                         self.landmark_dict[word] = seq
                         np.save(self.landmarks_dir / f"{word}.npy", seq)
                         logger.info(f"✅ Extracted DNA for: {word}")
+                        # Sync to cloud
+                        if self.gcs.client:
+                            self.gcs.upload_file(str(self.landmarks_dir / f"{word}.npy"), f"landmarks/{word}.npy")
 
     def train(self, augment_count: int = 50) -> bool:
         """
@@ -401,6 +417,11 @@ class WaselEngine:
             pickle.dump((self.classifier, self.label_encoder), f)
         
         logger.info(f"✅ Trained on {len(self.landmark_dict)} words ({len(X)} samples)")
+        
+        # Sync to cloud
+        if self.gcs.client:
+            self.gcs.upload_file(str(self.models_dir / "psl_classifier.pkl"), "models/psl_classifier.pkl")
+            
         return True
 
     def get_word_dna(self, word: str) -> Optional[np.ndarray]:

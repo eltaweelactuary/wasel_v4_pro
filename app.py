@@ -1,7 +1,11 @@
 """
 Wasel v4 Pro: Intelligent Sign Language Translator
-Clean, modular Streamlit interface (< 200 lines).
-Replaces 1270-line monolithic app.py from v3.
+Production-ready Streamlit app for Google Cloud Run.
+
+Workflow:
+  1. Text → PSL Video (Digital Human Avatar)
+  2. Video Upload → Text (Temporal Segmentation + Classification)
+  3. Live Camera → Real-time Recognition (WebRTC + Background Inference)
 """
 
 import os
@@ -9,16 +13,17 @@ import tempfile
 import logging
 import streamlit as st
 
-# ─── Page Config (must be first) ───
+# ─── Page Config (must be first Streamlit call) ───
 st.set_page_config(page_title="Wasel v4 Pro", page_icon="🤟", layout="wide")
 
 # ─── Logging ───
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 # ─── Environment ───
 DATA_DIR = os.environ.get("WASEL_DATA_DIR", os.path.join(tempfile.gettempdir(), "wasel_v4_data"))
 os.makedirs(DATA_DIR, exist_ok=True)
+
 
 # ═══════════════════════════════════════════
 # ─── CACHED RESOURCE LOADERS ───
@@ -34,18 +39,21 @@ def get_engine():
     )
     return engine
 
+
 @st.cache_resource
 def get_vocabulary():
     from backend.vocabulary import VocabularyManager
     return VocabularyManager(include_extended=True)
+
 
 @st.cache_resource
 def get_renderer():
     from backend.digital_human import DigitalHumanRenderer
     return DigitalHumanRenderer()
 
+
 def auto_setup(engine, vocab):
-    """Auto-build on first run, instant on subsequent runs."""
+    """Auto-build vocabulary and train classifier on first run."""
     if engine.classifier and len(engine.landmark_dict) > 0:
         return True
 
@@ -82,7 +90,7 @@ def auto_setup(engine, vocab):
 # ═══════════════════════════════════════════
 
 def main():
-    # ─── CSS ───
+    # ─── Custom CSS ───
     st.markdown("""<style>
         .main { background-color: #0f172a; }
         h1, h2, h3 { color: #38bdf8 !important; }
@@ -93,7 +101,7 @@ def main():
     st.markdown("**Next-Gen Pakistan Sign Language Translator** — YOLO + TensorFlow")
     st.divider()
 
-    # Load engines
+    # ─── Load Engines ───
     with st.spinner("⏳ Loading AI engines..."):
         engine = get_engine()
         vocab = get_vocabulary()
@@ -106,23 +114,35 @@ def main():
     # ─── Sidebar ───
     st.sidebar.success(f"💎 **Wasel v4 Pro** | Elite Studio")
     st.sidebar.success(f"🧠 **Engine:** {engine.backend['pose']} + {engine.backend['classifier']}")
+
+    if engine.gcs.client:
+        st.sidebar.info(f"☁️ **Cloud Storage:** Connected")
+    else:
+        st.sidebar.warning("💾 **Mode:** Local Storage")
+
     st.sidebar.info(f"📚 **Vocabulary:** {len(engine.get_available_words())} words")
 
     # ─── Tabs ───
-    tab_text, tab_video = st.tabs(["📝 Text → Video", "🎥 Video → Text"])
+    tab_text, tab_video, tab_live = st.tabs(["📝 Text → Video", "🎥 Video → Text", "🌐 Live Stream"])
 
-    # ─── TEXT → VIDEO ───
+    # ═══════════════════════════════════════
+    # TAB 1: TEXT → PSL VIDEO (AVATAR)
+    # ═══════════════════════════════════════
     with tab_text:
+        st.subheader("✍️ Translate English to PSL Avatar")
         text_input = st.text_input("Enter English text:", placeholder="good apple pakistan")
+
         if st.button("🔄 Translate to PSL", key="translate_btn"):
             if text_input:
                 words = text_input.lower().split()
                 dna_list = []
+                found_words = []
 
                 for w in words:
                     dna = engine.get_word_dna(w)
                     if dna is not None:
                         dna_list.append(dna)
+                        found_words.append(w)
                         st.success(f"✅ {w}")
                     else:
                         st.warning(f"⚠️ '{w}' not in vocabulary. Skipping.")
@@ -130,49 +150,91 @@ def main():
                 if dna_list:
                     out_path = os.path.join(tempfile.gettempdir(), "wasel_v4_output.mp4")
                     renderer.stitch_and_render(dna_list, out_path)
-                    st.video(out_path)
 
-    # ─── VIDEO → TEXT ───
+                    # Read file into memory BEFORE displaying
+                    with open(out_path, "rb") as video_file:
+                        video_bytes = video_file.read()
+                    st.video(video_bytes)
+                    st.caption(f"🧍 Avatar performing: **{' → '.join(found_words)}**")
+
+                    # Now safe to cleanup
+                    try:
+                        os.remove(out_path)
+                    except OSError:
+                        pass
+
+    # ═══════════════════════════════════════
+    # TAB 2: VIDEO → TEXT (UPLOAD)
+    # ═══════════════════════════════════════
     with tab_video:
-        col_upload, col_live = st.columns(2)
+        st.subheader("📁 Upload a Sign Language Video")
+        uploaded = st.file_uploader("Upload sign clip:", type=["mp4", "avi", "mov"])
 
-        with col_upload:
-            st.subheader("📁 Upload Video")
-            uploaded = st.file_uploader("Upload sign clip:", type=["mp4", "avi", "mov"])
-            if uploaded:
-                tmp = os.path.join(tempfile.gettempdir(), "wasel_v4_input.mp4")
-                with open(tmp, "wb") as f:
-                    f.write(uploaded.read())
+        if uploaded:
+            tmp = os.path.join(tempfile.gettempdir(), "wasel_v4_input.mp4")
+            with open(tmp, "wb") as f:
+                f.write(uploaded.read())
 
-                with st.spinner("🧠 Analyzing..."):
-                    labels, conf = engine.predict_sentence(tmp)
+            # Show the uploaded video
+            st.video(uploaded)
 
-                if labels:
-                    st.success(f"🎯 **Recognized:** {' '.join(labels)}")
-                    st.metric("Confidence", f"{conf:.1f}%")
-                else:
-                    st.warning("⚠️ No signs detected. Try a clearer video.")
+            with st.spinner("🧠 Analyzing signs..."):
+                labels, conf = engine.predict_sentence(tmp)
 
-        with col_live:
-            st.subheader("🌐 Live Stream")
+            # Cleanup temp file
             try:
-                from streamlit_webrtc import webrtc_streamer
-                from streaming.webrtc_hub import SignStreamProcessor
+                os.remove(tmp)
+            except OSError:
+                pass
 
-                webrtc_streamer(
-                    key="wasel_v4_live",
-                    video_processor_factory=lambda: SignStreamProcessor(engine=engine),
-                    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-                    media_stream_constraints={"video": True, "audio": False},
-                )
-            except ImportError:
-                st.info("📦 `streamlit-webrtc` required for live streaming.")
-            except Exception as e:
-                st.error(f"❌ Stream error: {e}")
+            if labels:
+                st.success(f"🎯 **Recognized:** {' '.join(labels)}")
+                st.metric("Confidence", f"{conf:.1f}%")
+
+                # Show reverse: recognized text → Avatar
+                st.divider()
+                st.subheader("🧍 Avatar Replay")
+                dna_list = [engine.get_word_dna(w) for w in labels if engine.get_word_dna(w) is not None]
+                if dna_list:
+                    replay_path = os.path.join(tempfile.gettempdir(), "wasel_v4_replay.mp4")
+                    renderer.stitch_and_render(dna_list, replay_path)
+                    with open(replay_path, "rb") as vf:
+                        st.video(vf.read())
+                    try:
+                        os.remove(replay_path)
+                    except OSError:
+                        pass
+            else:
+                st.warning("⚠️ No signs detected. Try a clearer video.")
+
+    # ═══════════════════════════════════════
+    # TAB 3: LIVE CAMERA STREAM
+    # ═══════════════════════════════════════
+    with tab_live:
+        st.subheader("🌐 Real-time Sign Language Recognition")
+        st.markdown("Point your camera at a signer. Recognition results appear as an overlay.")
+
+        try:
+            from streamlit_webrtc import webrtc_streamer
+            from streaming.webrtc_hub import SignStreamProcessor
+
+            webrtc_streamer(
+                key="wasel_v4_live",
+                video_processor_factory=lambda: SignStreamProcessor(engine=engine),
+                rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+                media_stream_constraints={"video": True, "audio": False},
+            )
+
+            st.info("💡 Signs are recognized in real-time. The overlay shows the predicted sign and confidence.")
+        except ImportError:
+            st.info("📦 `streamlit-webrtc` is required for live streaming. Install it with: `pip install streamlit-webrtc`")
+        except Exception as e:
+            st.error(f"❌ Stream error: {e}")
 
     # ─── Footer ───
     st.divider()
     st.caption("Designed by Ahmed Eltaweel | AI Architect @ Konecta 🚀")
+
 
 if __name__ == "__main__":
     main()

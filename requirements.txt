@@ -13,3 +13,5 @@ gTTS
 pydantic
 python-dotenv
 roboflow
+google-cloud-storage
+google-cloud-logging
